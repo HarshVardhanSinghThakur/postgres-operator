@@ -1,0 +1,145 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: managedpostgres.db.harshdev.io
+  annotations:
+    # Who built this — shows up in kubectl describe
+    operator.db.harshdev.io/version: "1.0.0"
+spec:
+  group: db.harshdev.io
+  scope: Namespaced          # lives inside a namespace, not cluster-wide
+  names:
+    plural: managedpostgres
+    singular: managedpostgres
+    kind: ManagedPostgres
+    shortNames:
+      - mpg                  # kubectl get mpg  ← short form
+  versions:
+    - name: v1
+      served: true           # this version is active
+      storage: true          # this is the version stored in etcd
+      # ── Status subresource ──────────────────────────────────────
+      # Enables operator to write .status without touching .spec.
+      # Without this, a status patch would also trigger an update event
+      # causing an infinite reconciliation loop.
+      subresources:
+        status: {}
+      # ── Schema ──────────────────────────────────────────────────
+      # K8s validates every applied YAML against this schema.
+      # Bad field → rejected at API server, never reaches operator.
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["version", "storage"]
+              properties:
+                version:
+                  type: string
+                  description: "PostgreSQL major version (e.g. '15', '16')"
+                  enum: ["14", "15", "16"]   # only valid versions allowed
+
+                storage:
+                  type: string
+                  description: "PVC size (e.g. '5Gi', '10Gi')"
+                  pattern: '^[0-9]+(Mi|Gi)$'
+
+                replicas:
+                  type: integer
+                  description: "Number of read replicas (0 = primary only)"
+                  minimum: 0
+                  maximum: 5
+                  default: 0
+
+                backupEnabled:
+                  type: boolean
+                  description: "Enable scheduled backups"
+                  default: false
+
+                backupSchedule:
+                  type: string
+                  description: "Cron expression for backups (e.g. '0 2 * * *')"
+                  default: "0 2 * * *"
+
+                backupBackend:
+                  type: string
+                  description: "Where to store backups: 'local' or 's3'"
+                  enum: ["local", "s3"]
+                  default: "local"
+
+                s3Config:
+                  type: object
+                  description: "Required only when backupBackend is 's3'"
+                  properties:
+                    bucket:
+                      type: string
+                    region:
+                      type: string
+                    credentialsSecret:
+                      type: string
+                      description: "Name of K8s Secret holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+
+                resources:
+                  type: object
+                  description: "CPU and memory for the postgres pod"
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                          default: "250m"
+                        memory:
+                          type: string
+                          default: "256Mi"
+                    limits:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                          default: "1000m"
+                        memory:
+                          type: string
+                          default: "512Mi"
+
+            # ── Status block ──────────────────────────────────────
+            # Operator writes here. Users read it with kubectl describe.
+            # Never written by the user — only by the operator.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: "Creating | Running | Degraded | Terminating"
+                message:
+                  type: string
+                  description: "Human readable explanation of current phase"
+                endpoint:
+                  type: string
+                  description: "DNS name to connect to this database"
+                lastBackup:
+                  type: string
+                  description: "ISO timestamp of last successful backup"
+                backupCount:
+                  type: integer
+                observedGeneration:
+                  type: integer
+                  description: "Last spec generation the operator reconciled"
+                conditions:
+                  type: array
+                  description: "Fine-grained status conditions (K8s convention)"
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string        # e.g. "DatabaseReady", "BackupConfigured"
+                      status:
+                        type: string        # "True" | "False" | "Unknown"
+                      reason:
+                        type: string        # machine-readable short string
+                      message:
+                        type: string        # human readable
+                      lastTransitionTime:
+                        type: string
