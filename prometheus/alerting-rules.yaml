@@ -1,0 +1,230 @@
+# alerting-rules.yaml — Prometheus alerting rules for postgres-operator
+#
+# Apply with: kubectl apply -f prometheus/alerting-rules.yaml
+# (Requires Prometheus Operator with PrometheusRule CRD)
+
+groups:
+  - name: postgres-operator.rules
+    interval: 30s
+    rules:
+      # ── Operator Health ──────────────────────────────────────────────────────
+
+      - alert: PostgresOperatorDown
+        expr: |
+          absent(up{job="postgres-operator"} == 1)
+          or
+          up{job="postgres-operator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: operator
+        annotations:
+          summary: "Postgres Operator is down"
+          description: |
+            The postgres-operator pod has not reported metrics for 2 minutes.
+            Check pod status: kubectl get pods -n {{ $labels.namespace }} -l app.kubernetes.io/name=postgres-operator
+          runbook_url: "https://github.com/harshdev/postgres-operator/blob/main/docs/runbooks/operator-down.md"
+
+      - alert: PostgresOperatorHighReconcileErrors
+        expr: |
+          rate(postgres_operator_reconcile_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "High reconciliation error rate"
+          description: |
+            Operator reconciliation error rate is {{ $value | humanizePercentage }} per second
+            in namespace {{ $labels.namespace }}.
+            Error type: {{ $labels.error_type }}
+          runbook_url: "https://github.com/harshdev/postgres-operator/blob/main/docs/runbooks/reconcile-errors.md"
+
+      - alert: PostgresOperatorReconcileSlow
+        expr: |
+          histogram_quantile(0.95,
+            rate(postgres_operator_reconcile_duration_seconds_bucket[5m])
+          ) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "Reconciliation taking too long"
+          description: |
+            95th percentile reconciliation duration is {{ $value | humanizeDuration }}
+            in namespace {{ $labels.namespace }}.
+            This may indicate API server latency or resource contention.
+
+      - alert: PostgresOperatorHighK8sAPICalls
+        expr: |
+          rate(postgres_operator_k8s_api_calls_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: info
+          component: operator
+        annotations:
+          summary: "High K8s API call rate"
+          description: |
+            Operator is making {{ $value }} API calls/second.
+            Operation: {{ $labels.operation }}, Resource: {{ $labels.resource }}
+            May indicate reconciliation thrashing or missing hash comparison.
+
+      # ── Instance Health ──────────────────────────────────────────────────────
+
+      - alert: PostgresInstanceDegraded
+        expr: |
+          postgres_operator_instances_total{phase="Degraded"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Postgres instance degraded"
+          description: |
+            ManagedPostgres {{ $labels.instance }} in namespace {{ $labels.namespace }}
+            is in Degraded phase.
+            Check: kubectl describe managedpostgres {{ $labels.instance }} -n {{ $labels.namespace }}
+
+      - alert: PostgresInstanceCreatingStuck
+        expr: |
+          postgres_operator_instances_total{phase="Creating"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Postgres instance stuck in Creating"
+          description: |
+            ManagedPostgres instance has been in Creating phase for 10+ minutes.
+            Likely cause: PVC pending, image pull failure, or RBAC issue.
+
+      - alert: PostgresInstanceMissing
+        expr: |
+          absent(postgres_operator_instances_total) == 1
+        for: 5m
+        labels:
+          severity: info
+          component: database
+        annotations:
+          summary: "No Postgres instances managed"
+          description: |
+            Operator is running but managing zero instances.
+            This is normal if no ManagedPostgres resources exist.
+
+      # ── Backup Alerts ────────────────────────────────────────────────────────
+
+      - alert: PostgresBackupFailed
+        expr: |
+          increase(postgres_operator_backups_failed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "Postgres backup failed"
+          description: |
+            Backup for instance {{ $labels.instance }} in namespace {{ $labels.namespace }}
+            failed (backend: {{ $labels.backend }}).
+            Check CronJob logs: kubectl logs -n {{ $labels.namespace }} -l job-name={{ $labels.instance }}-backup
+
+      - alert: PostgresBackupStale
+        expr: |
+          time() - postgres_operator_last_backup_timestamp_seconds > 25 * 3600
+        for: 0m
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "Postgres backup stale (>25h)"
+          description: |
+            No successful backup for instance {{ $labels.instance }} in namespace {{ $labels.namespace }}
+            for {{ $value | humanizeDuration }}.
+            Expected schedule: daily. Check backup CronJob and storage backend.
+
+      - alert: PostgresBackupLowRetention
+        expr: |
+          postgres_operator_backup_files_total < 3
+        for: 1h
+        labels:
+          severity: warning
+          component: backup
+        annotations:
+          summary: "Low backup retention count"
+          description: |
+            Only {{ $value }} backup files for instance {{ $labels.instance }}.
+            Retention policy may be too aggressive or backups are failing.
+
+      # ── Restore Alerts ───────────────────────────────────────────────────────
+
+      - alert: PostgresRestoreFailed
+        expr: |
+          increase(postgres_operator_restores_failed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: restore
+        annotations:
+          summary: "Postgres restore failed"
+          description: |
+            Restore operation failed in namespace {{ $labels.namespace }}.
+            Check PostgresRestore resource status and Job logs.
+
+      - alert: PostgresRestoreSlow
+        expr: |
+          histogram_quantile(0.95,
+            rate(postgres_operator_restore_duration_seconds_bucket[1h])
+          ) > 600
+        for: 0m
+        labels:
+          severity: warning
+          component: restore
+        annotations:
+          summary: "Postgres restore taking too long"
+          description: |
+            95th percentile restore duration is {{ $value | humanizeDuration }}.
+            Large database or slow storage backend.
+
+      # ── Resource Alerts ──────────────────────────────────────────────────────
+
+      - alert: PostgresInstanceHighMemoryUsage
+        expr: |
+          (container_memory_usage_bytes{pod=~"postgres-.*"} / container_spec_memory_limit_bytes{pod=~"postgres-.*"}) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Postgres pod memory usage > 90%"
+          description: |
+            Pod {{ $labels.pod }} in namespace {{ $labels.namespace }}
+            is using {{ $value | humanizePercentage }} of memory limit.
+            Consider increasing memory limit or investigating memory leak.
+
+      - alert: PostgresInstanceHighCPUUsage
+        expr: |
+          (rate(container_cpu_usage_seconds_total{pod=~"postgres-.*"}[5m]) / container_spec_cpu_quota{pod=~"postgres-.*"} / container_spec_cpu_period{pod=~"postgres-.*"}) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Postgres pod CPU usage > 90%"
+          description: |
+            Pod {{ $labels.pod }} in namespace {{ $labels.namespace }}
+            is using {{ $value | humanizePercentage }} of CPU limit.
+            Consider increasing CPU limit or investigating query performance.
+
+      - alert: PostgresPVCUsageHigh
+        expr: |
+          (kubelet_volume_stats_used_bytes{persistentvolumeclaim=~"postgres-.*-data"} / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"postgres-.*-data"}) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Postgres PVC usage > 85%"
+          description: |
+            PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }}
+            is at {{ $value | humanizePercentage }} capacity.
+            Plan storage expansion or data cleanup.
