@@ -1,0 +1,27 @@
+{{- /*
+ServiceMonitor for Prometheus Operator
+Allows Prometheus to discover and scrape the operator's /metrics endpoint.
+Requires Prometheus Operator CRDs to be installed in the cluster.
+*/ -}}
+{{- if .Values.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "postgres-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgres-operator.labels" . | nindent 4 }}
+    release: {{ .Values.serviceMonitor.prometheusRelease }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "postgres-operator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+{{- end -}}

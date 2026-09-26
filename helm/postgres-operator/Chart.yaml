@@ -1,0 +1,17 @@
+apiVersion: v2
+name: postgres-operator
+description: A Kubernetes operator for managing PostgreSQL databases
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+home: https://github.com/harshdev/postgres-operator
+keywords:
+  - postgresql
+  - operator
+  - database
+  - kubernetes
+maintainers:
+  - name: Harsh Dev
+    email: harsh@example.com
+sources:
+  - https://github.com/harshdev/postgres-operator

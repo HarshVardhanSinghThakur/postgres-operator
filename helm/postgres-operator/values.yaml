@@ -1,0 +1,90 @@
+# Default values for postgres-operator Helm chart
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: harshdev/postgres-operator
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Operator configuration
+logLevel: "INFO"
+reconcileInterval: 60
+
+# Metrics endpoint
+metrics:
+  port: 8080
+
+# ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  enabled: true
+  # Prometheus Operator release name (used for label selector)
+  prometheusRelease: "prometheus"
+  interval: 30s
+  scrapeTimeout: 10s
+
+# Backup configuration (used by operator to create CronJobs)
+backup:
+  enabled: false
+  schedule: "0 2 * * *"
+  backend: "local"
+  retentionDays: 7
+  image: "harshdev/postgres-backup:latest"
+  s3:
+    bucket: ""
+    region: "us-east-1"
+    credentialsSecret: ""
+
+# Default database configuration
+database:
+  version: "15"
+  storage: "5Gi"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
