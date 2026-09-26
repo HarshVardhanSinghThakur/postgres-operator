@@ -81,6 +81,27 @@ spec:
                       type: string
                       description: "Name of K8s Secret holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
 
+                backupRetentionDays:
+                  type: integer
+                  description: "How many days of backups to keep (default 7)"
+                  minimum: 1
+                  default: 7
+
+                backupStorage:
+                  type: string
+                  description: "Size of the dedicated backup-data PVC for local backend (default 5Gi)"
+                  pattern: '^[0-9]+(Mi|Gi)$'
+                  default: "5Gi"
+
+                backupImage:
+                  type: string
+                  description: "Backup container image. Overrides Helm values and operator default."
+
+                autoRestore:
+                  type: boolean
+                  description: "Auto-create a PostgresRestore with backupFile 'latest' when data loss is detected (default true)"
+                  default: true
+
                 resources:
                   type: object
                   description: "CPU and memory for the postgres pod"

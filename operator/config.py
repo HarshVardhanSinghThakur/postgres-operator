@@ -44,6 +44,36 @@ DEFAULT_MEMORY_LIMIT       = "512Mi"
 # ── Postgres image ────────────────────────────────────────────────────────────
 POSTGRES_IMAGE_TEMPLATE = "postgres:{version}-alpine"  # alpine = smaller image
 
+# ── Backup image ──────────────────────────────────────────────────────────────
+# Resolution order: spec.backupImage > BACKUP_IMAGE env (Helm values.backup.image) > default.
+# Never hardcode the image in handlers — always resolve via backup_image_for_spec().
+DEFAULT_BACKUP_IMAGE = "harshdev/postgres-backup:latest"
+BACKUP_IMAGE_ENV_VAR = "BACKUP_IMAGE"
+
+# ── Backup data PVC ───────────────────────────────────────────────────────────
+# Dedicated PVC that stores local backups. It is created WITHOUT an owner
+# reference so it survives ManagedPostgres deletion — this is what makes
+# "delete database → restore everything" possible.
+# PVC name: <instance-name>-backup-data, mounted at /backups in CronJob/Job pods.
+DEFAULT_BACKUP_STORAGE = "5Gi"
+BACKUP_DATA_PVC_SUFFIX = "-backup-data"
+
+# ── Finalizer ─────────────────────────────────────────────────────────────────
+# Added to every ManagedPostgres. On delete the operator takes a final backup
+# Job, then removes the finalizer so K8s can finish deletion.
+FINALIZER = f"{API_GROUP}/finalizer"
+
+# ── Auto-restore ──────────────────────────────────────────────────────────────
+# When True (default) the operator auto-creates a PostgresRestore with
+# backupFile "latest" whenever it detects data loss:
+#   - a brand-new instance whose backup PVC already has backups (re-created
+#     after a delete), or
+#   - an existing instance whose data PVC had to be recreated.
+# The restore Job resolves "latest" to the newest file at runtime.
+AUTO_RESTORE_ANNOTATION = f"{API_GROUP}/auto-restore"
+AUTO_RESTORE_LABEL = "postgres-restore-auto"
+AUTO_RESTORE_DEDUP_MINUTES = 15
+
 # ── Local backup path (used when backupBackend = local) ───────────────────────
 # This path is inside the backup job container.
 # In real setup, mount a PVC here so backups survive pod restarts.
@@ -92,3 +122,23 @@ def postgres_image(version: str) -> str:
         postgres_image("15") → "postgres:15-alpine"
     """
     return POSTGRES_IMAGE_TEMPLATE.format(version=version)
+
+
+def backup_image_for_spec(spec: dict) -> str:
+    """
+    Resolve which backup image to use.
+
+    Priority: spec.backupImage > BACKUP_IMAGE env var > DEFAULT_BACKUP_IMAGE.
+    """
+    import os
+
+    return (
+        spec.get("backupImage")
+        or os.environ.get(BACKUP_IMAGE_ENV_VAR)
+        or DEFAULT_BACKUP_IMAGE
+    )
+
+
+def backup_data_pvc_name(instance_name: str) -> str:
+    """Name of the dedicated backup-data PVC for an instance."""
+    return f"{instance_name}{BACKUP_DATA_PVC_SUFFIX}"

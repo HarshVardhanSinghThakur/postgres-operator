@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Kind / kubeconfig
+kind-config*.yaml
+*.kubeconfig
+
+# Helm
+*.tgz
+helm/postgres-operator/charts/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local secrets (never commit real credentials)
+*-creds.yaml
+secrets/

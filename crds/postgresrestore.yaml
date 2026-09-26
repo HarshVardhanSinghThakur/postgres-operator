@@ -31,7 +31,7 @@ spec:
                   description: "Name of the ManagedPostgres to restore into"
                 backupFile:
                   type: string
-                  description: "Backup filename to restore from"
+                  description: "Backup filename to restore from, or 'latest' to auto-pick the newest backup"
             status:
               type: object
               properties:
