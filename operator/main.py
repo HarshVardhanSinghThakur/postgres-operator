@@ -35,8 +35,10 @@ ERROR HANDLING STRATEGY:
 
 import logging
 import time
+from datetime import datetime, timezone
 
 import kopf
+from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
 
@@ -45,12 +47,140 @@ from config import (
     PHASE_RUNNING, PHASE_DEGRADED,
     CONDITION_DATABASE_READY, CONDITION_BACKUP_CONFIGURED, CONDITION_STORAGE_READY,
     RETRY_INITIAL_DELAY,
+    FINALIZER,
+    AUTO_RESTORE_LABEL, AUTO_RESTORE_DEDUP_MINUTES,
+    backup_image_for_spec,
 )
 from metrics import METRICS
 from provisioner import Provisioner
 from status import StatusManager
+from restore import RestoreManager
 
 logger = logging.getLogger(__name__)
+
+
+# ── Finalizer + auto-restore helpers ──────────────────────────────────────────
+
+def _custom_api() -> k8s_client.CustomObjectsApi:
+    """CustomObjectsApi client (works in-cluster and with local kubeconfig)."""
+    return k8s_client.CustomObjectsApi()
+
+
+def get_managedpostgres(namespace: str, name: str) -> dict | None:
+    """Fetch a ManagedPostgres CR. Returns None if it doesn't exist."""
+    try:
+        return _custom_api().get_namespaced_custom_object(
+            group=API_GROUP, version=API_VERSION,
+            namespace=namespace, plural="managedpostgres", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def ensure_finalizer(namespace: str, name: str, finalizers: list | None):
+    """
+    Make sure our finalizer is present so delete always goes through on_delete
+    (final backup). No-op if already present. Never blocks provisioning on error.
+    """
+    if finalizers and FINALIZER in finalizers:
+        return
+    try:
+        _custom_api().patch_namespaced_custom_object(
+            group=API_GROUP, version=API_VERSION,
+            namespace=namespace, plural="managedpostgres", name=name,
+            body={"metadata": {"finalizers": (finalizers or []) + [FINALIZER]}},
+        )
+        logger.info(f"[{name}] Finalizer added")
+    except ApiException as e:
+        logger.warning(f"[{name}] Could not add finalizer (non-fatal): {e.reason}")
+
+
+def remove_finalizer(namespace: str, name: str):
+    """Remove our finalizer so K8s can finish deletion. 404 = already gone."""
+    try:
+        obj = get_managedpostgres(namespace, name)
+        if obj is None:
+            return
+        finalizers = (obj.get("metadata") or {}).get("finalizers") or []
+        if FINALIZER not in finalizers:
+            return
+        remaining = [f for f in finalizers if f != FINALIZER]
+        _custom_api().patch_namespaced_custom_object(
+            group=API_GROUP, version=API_VERSION,
+            namespace=namespace, plural="managedpostgres", name=name,
+            body={"metadata": {"finalizers": remaining}},
+        )
+        logger.info(f"[{name}] Finalizer removed — deletion unblocked")
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(f"[{name}] Could not remove finalizer: {e.reason}")
+
+
+def maybe_auto_restore(namespace: str, name: str, spec: dict, reason: str):
+    """
+    Auto-create a PostgresRestore with backupFile "latest" after detected data
+    loss. Deduplicates: skips if an auto-restore CR was created in the last
+    AUTO_RESTORE_DEDUP_MINUTES. Best-effort — never raises.
+    """
+    if not spec.get("backupEnabled", False):
+        return None
+    if not spec.get("autoRestore", True):
+        logger.debug(f"[{name}] autoRestore disabled — skipping ({reason})")
+        return None
+
+    try:
+        api = _custom_api()
+        existing = api.list_namespaced_custom_object(
+            group=API_GROUP, version=API_VERSION,
+            namespace=namespace, plural="postgresrestores",
+            label_selector=f"{AUTO_RESTORE_LABEL}=true",
+        )
+        cutoff = time.time() - AUTO_RESTORE_DEDUP_MINUTES * 60
+        for item in existing.get("items", []):
+            item_spec = (item.get("spec") or {})
+            if item_spec.get("targetDatabase") != name:
+                continue
+            ts = ((item.get("metadata") or {}).get("creationTimestamp") or "")
+            try:
+                created = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if created >= cutoff:
+                logger.info(f"[{name}] Recent auto-restore exists — skipping ({reason})")
+                return None
+
+        restore_name = (
+            f"{name}-auto-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        )[:253]
+        body = {
+            "apiVersion": f"{API_GROUP}/{API_VERSION}",
+            "kind": "PostgresRestore",
+            "metadata": {
+                "name": restore_name,
+                "namespace": namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "postgres-operator",
+                    "app.kubernetes.io/instance": name,
+                    AUTO_RESTORE_LABEL: "true",
+                },
+                "annotations": {
+                    f"{API_GROUP}/auto-restore-reason": reason,
+                },
+            },
+            "spec": {"targetDatabase": name, "backupFile": "latest"},
+        }
+        api.create_namespaced_custom_object(
+            group=API_GROUP, version=API_VERSION,
+            namespace=namespace, plural="postgresrestores", body=body,
+        )
+        logger.info(f"[{name}] Auto-restore triggered: {restore_name} ({reason})")
+        return restore_name
+    except ApiException as e:
+        logger.warning(f"[{name}] Auto-restore failed (non-fatal): {e.reason}")
+        return None
 
 # ── Operator startup ──────────────────────────────────────────────────────────
 
@@ -68,7 +198,6 @@ def on_startup(settings: kopf.OperatorSettings, **kwargs):
     settings.watching.server_timeout  = 300    # re-establish watch every 5 min
 
     # Start Prometheus metrics server on :8080/metrics
-    from metrics import METRICS
     METRICS.start_metrics_server()
 
     logger.info("Postgres Operator started")
@@ -116,6 +245,10 @@ def on_create(spec, meta, status, patch, **kwargs):
     try:
         p = Provisioner(namespace, name, uid, spec, api_ver)
 
+        # Register our finalizer first: guarantees on_delete runs (final backup)
+        # even if provisioning below fails partway.
+        ensure_finalizer(namespace, name, meta.get("finalizers"))
+
         # Each ensure_* call is idempotent: create if missing, patch if changed
         action, _ = p.ensure_secret()
         logger.info(f"[{name}] Secret: {action}")
@@ -133,10 +266,16 @@ def on_create(spec, meta, status, patch, **kwargs):
 
         # Backup is optional — only configure if user enabled it
         if spec.get("backupEnabled", False):
-            # TODO: replace with your actual backup image once built
-            backup_image = "harshdev/postgres-backup:latest"
+            backup_image = backup_image_for_spec(spec)
+            # Ownerless backup-data PVC first: CronJob mounts it at /backups.
+            # "exists" means backups from a previous incarnation may be present.
+            bp_action, _ = p.ensure_backup_data_pvc()
+            logger.info(f"[{name}] BackupPVC: {bp_action}")
             action, _    = p.ensure_backup_cronjob(backup_image)
             logger.info(f"[{name}] CronJob: {action}")
+            if bp_action == "exists":
+                # Re-created instance, old backups survived → restore latest.
+                maybe_auto_restore(namespace, name, spec, reason="recreated-with-backups")
             sm.set_condition(
                 CONDITION_BACKUP_CONFIGURED, "True",
                 "CronJobCreated",
@@ -238,6 +377,9 @@ def on_update(spec, meta, status, patch, old, new, diff, **kwargs):
     try:
         p = Provisioner(namespace, name, uid, spec, api_ver)
 
+        # Re-assert finalizer (covers objects created before finalizer support).
+        ensure_finalizer(namespace, name, meta.get("finalizers"))
+
         # Re-run all ensure_* — each one uses hash comparison to decide
         # whether to actually patch. If nothing changed for a resource, it's a noop.
         p.ensure_secret()
@@ -246,7 +388,8 @@ def on_update(spec, meta, status, patch, old, new, diff, **kwargs):
         p.ensure_service()
 
         if spec.get("backupEnabled", False):
-            backup_image = "harshdev/postgres-backup:latest"
+            backup_image = backup_image_for_spec(spec)
+            p.ensure_backup_data_pvc()
             p.ensure_backup_cronjob(backup_image)
             sm.set_condition(
                 CONDITION_BACKUP_CONFIGURED, "True",
@@ -288,30 +431,42 @@ def on_delete(spec, meta, status, patch, **kwargs):
     IMPORTANT: We don't manually delete child resources here.
     Owner references handle that automatically — when ManagedPostgres
     is deleted, K8s garbage-collects all resources that have it as owner.
+    The backup-data PVC is ownerless on purpose, so backups survive.
 
     What we DO here:
-      1. Mark status as Terminating
-      2. Log the deletion with relevant metadata
+      1. Take a final backup Job (orphan — outlives the CR)
+      2. Remove our finalizer so K8s can finish deletion
       3. Decrement running instance metrics
 
-    If backups are enabled, a production operator would trigger a
-    final backup here before teardown. We log a warning for now
-    and will add that in the backup phase.
+    Deletion is never blocked on backup success: a failed final backup is
+    logged, the finalizer is still removed, and the pre-existing scheduled
+    backups remain in the surviving backup-data PVC.
     """
     name      = meta["name"]
     namespace = meta["namespace"]
+    uid       = meta.get("uid", "")
+    api_ver   = f"{API_GROUP}/{API_VERSION}"
 
     logger.info(f"DELETE: {namespace}/{name}")
 
-    sm = StatusManager(namespace, name, patch, status)
-    sm.mark_terminating()
-
     if spec.get("backupEnabled", False):
-        logger.warning(
-            f"[{name}] Deletion triggered with backupEnabled=true. "
-            "Final backup before teardown not yet implemented. "
-            "Ensure you have a recent backup before deleting."
-        )
+        try:
+            p = Provisioner(namespace, name, uid, spec, api_ver)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            job = p.build_final_backup_job(
+                backup_image_for_spec(spec), f"{name}-final-backup-{ts}"
+            )
+            k8s_client.BatchV1Api().create_namespaced_job(namespace, job)
+            logger.info(f"[{name}] Final backup Job created: {job.metadata.name}")
+        except ApiException as e:
+            logger.warning(f"[{name}] Final backup failed (non-blocking): {e.reason}")
+        except Exception:
+            logger.exception(f"[{name}] Final backup failed (non-blocking)")
+    else:
+        logger.info(f"[{name}] Backup disabled — no final backup taken")
+
+    # Unblock deletion regardless of backup outcome.
+    remove_finalizer(namespace, name)
 
     # Decrement the running instance gauge
     METRICS.instances_total.labels(namespace=namespace, phase=PHASE_RUNNING).dec()
@@ -319,7 +474,8 @@ def on_delete(spec, meta, status, patch, **kwargs):
 
     logger.info(
         f"[{name}] DELETE handler done. "
-        "K8s will garbage-collect owned resources via owner references."
+        "K8s will garbage-collect owned resources via owner references. "
+        "Backup-data PVC is ownerless and retained."
     )
 
 
@@ -362,6 +518,9 @@ def reconcile(spec, meta, status, patch, **kwargs):
     try:
         p = Provisioner(namespace, name, uid, spec, api_ver)
 
+        # Re-assert finalizer (self-heals objects created before finalizer support).
+        ensure_finalizer(namespace, name, meta.get("finalizers"))
+
         results = {
             "secret":      p.ensure_secret()[0],
             "pvc":         p.ensure_pvc()[0],
@@ -370,16 +529,23 @@ def reconcile(spec, meta, status, patch, **kwargs):
         }
 
         if spec.get("backupEnabled", False):
+            p.ensure_backup_data_pvc()
             results["cronjob"] = p.ensure_backup_cronjob(
-                "harshdev/postgres-backup:latest"
+                backup_image_for_spec(spec)
             )[0]
 
-        # Only log if something was recreated (drift detected and healed)
+        # Only log if something was recreated (drift detected and healed).
+        # INFO, not WARNING: self-healing is the normal steady state.
         drifted = {k: v for k, v in results.items() if v != "unchanged"}
         if drifted:
-            logger.warning(f"[{name}] Drift detected and healed: {drifted}")
+            logger.info(f"[{name}] Drift detected and healed: {drifted}")
             sm = StatusManager(namespace, name, patch, status)
             sm.mark_running(p.endpoint())
+            sm.set_observed_generation(meta.get("generation", 1))
+            if results.get("pvc") == "created" and spec.get("backupEnabled", False):
+                # Data PVC was gone and got recreated empty → data loss.
+                # Backups live in the surviving backup-data PVC → auto-restore.
+                maybe_auto_restore(namespace, name, spec, reason="data-pvc-recreated")
 
         duration = time.monotonic() - start
         result   = "healed" if drifted else "noop"
@@ -401,15 +567,11 @@ def on_restore_create(spec, meta, status, patch, **kwargs):
     """
     Fires when a PostgresRestore resource is applied.
 
-    Restore flow (to be fully implemented in backup phase):
-      1. Find the target ManagedPostgres instance
-      2. Download the specified backup file
-      3. Spin up a restore Job
-      4. Job runs: psql < backup.sql
-      5. Update status when complete
-
-    For now: validates input and marks as Pending.
-    Full implementation comes in turn 3 (backup phase).
+    Restore flow:
+      1. Validate targetDatabase exists and backupFile is specified
+      2. Create a K8s Job to perform the restore
+      3. Job: initContainer downloads backup → main container runs psql
+      4. Update PostgresRestore status: Pending → Running → Completed/Failed
     """
     name            = meta["name"]
     namespace       = meta["namespace"]
@@ -418,12 +580,93 @@ def on_restore_create(spec, meta, status, patch, **kwargs):
 
     logger.info(f"RESTORE: {namespace}/{name} → {target_database} from {backup_file}")
 
-    patch.status["phase"]   = "Pending"
-    patch.status["message"] = (
-        f"Restore from {backup_file} into {target_database} queued. "
-        "Full restore implementation coming in backup phase."
-    )
-    patch.status["startTime"] = __import__("datetime").datetime.utcnow().isoformat()
+    if not target_database or not backup_file:
+        raise kopf.PermanentError("targetDatabase and backupFile are required")
+
+    # Fail fast with a clear message instead of a Job that can never succeed.
+    target = get_managedpostgres(namespace, target_database)
+    if target is None:
+        raise kopf.PermanentError(
+            f"targetDatabase '{target_database}' does not exist in namespace "
+            f"'{namespace}'. Create the ManagedPostgres first."
+        )
+    db_spec = (target.get("spec") or {})
+
+    backup_image = backup_image_for_spec(db_spec)
+
+    sm = StatusManager(namespace, name, patch, status)
+    sm.mark_creating()
+    patch.status["phase"] = "Pending"
+    patch.status["message"] = f"Creating restore Job for {target_database}"
+    patch.status["startTime"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        mgr = RestoreManager(
+            namespace, name, target_database, backup_file,
+            spec, f"{API_GROUP}/{API_VERSION}", db_spec=db_spec,
+        )
+        action, job = mgr.create_job(backup_image)
+
+        if action == "created":
+            patch.status["phase"] = "Running"
+            patch.status["message"] = f"Restore Job {job.metadata.name} created"
+            patch.status["jobName"] = job.metadata.name
+            METRICS.restores_started.labels(namespace=namespace).inc()
+            logger.info(f"[{name}] Restore Job created: {job.metadata.name}")
+        else:
+            patch.status["phase"] = "Running"
+            patch.status["message"] = f"Restore Job already exists"
+            patch.status["jobName"] = job.metadata.name
+
+    except Exception as e:
+        patch.status["phase"] = "Failed"
+        patch.status["message"] = f"Failed to create restore Job: {e}"
+        METRICS.restores_failed.labels(namespace=namespace).inc()
+        logger.exception(f"[{name}] Failed to create restore Job")
+        raise kopf.TemporaryError(str(e), delay=30)
+
+
+# ── RESTORE RECONCILE TIMER ─────────────────────────────────────────────────────
+
+@kopf.timer(API_GROUP, API_VERSION, "postgresrestores", interval=30.0, sharp=True)
+def restore_reconcile(spec, meta, status, patch, **kwargs):
+    """
+    Reconcile PostgresRestore — check Job status and update CR status.
+
+    Runs every 30 seconds until restore completes or fails.
+    """
+    name        = meta["name"]
+    namespace   = meta["namespace"]
+    target_db   = spec.get("targetDatabase")
+    backup_file = spec.get("backupFile")
+    job_name    = status.get("jobName", f"{name}-restore")
+
+    current_phase = status.get("phase", "Pending")
+    if current_phase in ("Completed", "Failed"):
+        return  # Terminal state — nothing to do
+
+    try:
+        mgr = RestoreManager(namespace, name, target_db, backup_file, spec, f"{API_GROUP}/{API_VERSION}")
+        job_status = mgr.get_job_status(job_name)
+
+        new_phase = job_status["phase"]
+        message   = job_status["message"]
+
+        if new_phase != current_phase:
+            patch.status["phase"] = new_phase
+            patch.status["message"] = message
+            if new_phase == "Completed":
+                patch.status["completionTime"] = datetime.now(timezone.utc).isoformat()
+                METRICS.restores_completed.labels(namespace=namespace).inc()
+                logger.info(f"[{name}] Restore completed successfully")
+            elif new_phase == "Failed":
+                patch.status["completionTime"] = datetime.now(timezone.utc).isoformat()
+                METRICS.restores_failed.labels(namespace=namespace).inc()
+                logger.error(f"[{name}] Restore failed: {message}")
+
+    except Exception as e:
+        logger.error(f"[{name}] Restore reconcile error: {e}")
+        # Don't raise — timer tick failure shouldn't crash operator
 
 
 # ── Operator entrypoint ───────────────────────────────────────────────────────
