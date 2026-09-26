@@ -1,0 +1,69 @@
+{{- /*
+RBAC for postgres-operator.
+ServiceAccount + ClusterRole + ClusterRoleBinding.
+
+The operator manages: ManagedPostgres + PostgresRestore CRs (including
+status subresource and finalizers), and child resources: Secrets, PVCs,
+StatefulSets, Services, CronJobs, Jobs.
+*/ -}}
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "postgres-operator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgres-operator.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "postgres-operator.fullname" . }}
+  labels:
+    {{- include "postgres-operator.labels" . | nindent 4 }}
+rules:
+  # Custom resources: full lifecycle + status + finalizers.
+  # - status: kopf writes .status via the status subresource.
+  # - finalizers: operator adds/removes db.harshdev.io/finalizer.
+  # - create on postgresrestores: auto-restore creates PostgresRestore CRs.
+  - apiGroups: ["db.harshdev.io"]
+    resources: ["managedpostgres", "postgresrestores"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["db.harshdev.io"]
+    resources: ["managedpostgres/status", "postgresrestores/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["db.harshdev.io"]
+    resources: ["managedpostgres/finalizers"]
+    verbs: ["update", "patch"]
+  # Child resources owned by ManagedPostgres.
+  # - persistentvolumeclaims: includes the ownerless backup-data PVC.
+  # - jobs: backup/restore/final-backup Jobs (orphans included).
+  - apiGroups: [""]
+    resources: ["secrets", "persistentvolumeclaims", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "postgres-operator.fullname" . }}
+  labels:
+    {{- include "postgres-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "postgres-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "postgres-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
