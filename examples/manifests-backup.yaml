@@ -1,0 +1,26 @@
+# ManagedPostgres with local backup enabled
+# Apply with: kubectl apply -f examples/manifests-backup.yaml
+
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: app-with-backup
+  namespace: default
+  labels:
+    environment: development
+    team: backend
+spec:
+  version: "15"
+  storage: "10Gi"
+  replicas: 0
+  backupEnabled: true
+  backupSchedule: "0 2 * * *"
+  backupBackend: "local"
+  backupRetentionDays: 7
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"

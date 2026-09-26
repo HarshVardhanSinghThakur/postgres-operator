@@ -1,0 +1,76 @@
+# Example ManagedPostgres resources for testing
+# Apply with: kubectl apply -f examples/manifests.yaml
+
+---
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: my-app-db
+  namespace: default
+  labels:
+    environment: development
+    team: backend
+spec:
+  version: "15"
+  storage: "5Gi"
+  replicas: 0
+  backupEnabled: false
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+
+---
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: staging-db
+  namespace: default
+  labels:
+    environment: staging
+    team: backend
+spec:
+  version: "15"
+  storage: "10Gi"
+  replicas: 1
+  backupEnabled: true
+  backupSchedule: "0 3 * * *"
+  backupBackend: "local"
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "1Gi"
+
+---
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: prod-db
+  namespace: default
+  labels:
+    environment: production
+    team: backend
+spec:
+  version: "16"
+  storage: "50Gi"
+  replicas: 2
+  backupEnabled: true
+  backupSchedule: "0 2 * * *"
+  backupBackend: "s3"
+  s3Config:
+    bucket: "my-prod-backups"
+    region: "us-east-1"
+    credentialsSecret: "aws-prod-creds"
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"

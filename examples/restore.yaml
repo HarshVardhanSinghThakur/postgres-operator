@@ -1,0 +1,14 @@
+# PostgresRestore example - restore from backup
+# Apply with: kubectl apply -f examples/restore.yaml
+#
+# First, find a backup filename from backup job logs:
+# kubectl logs -n default -l app.kubernetes.io/component=backup --tail=50 | grep "Backup stored at"
+
+apiVersion: db.harshdev.io/v1
+kind: PostgresRestore
+metadata:
+  name: restore-staging-to-dev
+  namespace: default
+spec:
+  targetDatabase: my-app-db
+  backupFile: staging-db-20260901T020000Z.sql.gz

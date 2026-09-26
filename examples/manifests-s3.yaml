@@ -1,0 +1,36 @@
+# ManagedPostgres with S3 backup (requires AWS credentials Secret)
+# Apply with: kubectl apply -f examples/manifests-s3.yaml
+#
+# First create the credentials secret:
+# kubectl create secret generic aws-backup-creds \
+#   --from-literal=AWS_ACCESS_KEY_ID=your-access-key \
+#   --from-literal=AWS_SECRET_ACCESS_KEY=your-secret-key \
+#   -n default
+
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: app-with-s3-backup
+  namespace: default
+  labels:
+    environment: staging
+    team: backend
+spec:
+  version: "15"
+  storage: "20Gi"
+  replicas: 1
+  backupEnabled: true
+  backupSchedule: "0 2 * * *"
+  backupBackend: "s3"
+  backupRetentionDays: 30
+  s3Config:
+    bucket: "my-staging-backups"
+    region: "us-east-1"
+    credentialsSecret: "aws-backup-creds"
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "1Gi"

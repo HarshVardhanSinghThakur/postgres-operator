@@ -1,0 +1,63 @@
+# Invalid ManagedPostgres examples - for testing CRD validation
+# These SHOULD fail when applied
+
+---
+# Invalid: storage format wrong (missing unit)
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: invalid-storage-format
+  namespace: default
+spec:
+  version: "15"
+  storage: "10"  # Should be "10Gi" or "10240Mi"
+
+---
+# Invalid: version not in enum
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: invalid-version
+  namespace: default
+spec:
+  version: "13"  # Not in allowed enum: ["14", "15", "16"]
+  storage: "5Gi"
+
+---
+# Invalid: replicas exceeds maximum
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: invalid-replicas
+  namespace: default
+spec:
+  version: "15"
+  storage: "5Gi"
+  replicas: 10  # Maximum is 5
+
+---
+# Invalid: backupBackend not in enum
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: invalid-backend
+  namespace: default
+spec:
+  version: "15"
+  storage: "5Gi"
+  backupEnabled: true
+  backupBackend: "gcs"  # Not in allowed enum: ["local", "s3"]
+
+---
+# Invalid: missing required s3Config when backend=s3
+apiVersion: db.harshdev.io/v1
+kind: ManagedPostgres
+metadata:
+  name: missing-s3-config
+  namespace: default
+spec:
+  version: "15"
+  storage: "5Gi"
+  backupEnabled: true
+  backupBackend: "s3"
+  # s3Config is required when backupBackend=s3

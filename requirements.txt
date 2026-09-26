@@ -1,0 +1,6 @@
+kopf>=1.37
+kubernetes>=28.1
+prometheus-client>=0.19
+ruff>=0.1.0
+pytest>=7.4
+pytest-asyncio>=0.21
