@@ -139,6 +139,37 @@ class OperatorMetrics:
             # result: success | failure
         )
 
+        # ── 5. Restore ──────────────────────────────────────────────────────────
+
+        # Counter: restore operations started
+        self.restores_started = Counter(
+            "postgres_operator_restores_started_total",
+            "Total restore operations started",
+            labelnames=["namespace"],
+        )
+
+        # Counter: restore operations completed successfully
+        self.restores_completed = Counter(
+            "postgres_operator_restores_completed_total",
+            "Total restore operations completed successfully",
+            labelnames=["namespace"],
+        )
+
+        # Counter: restore operations failed
+        self.restores_failed = Counter(
+            "postgres_operator_restores_failed_total",
+            "Total restore operations failed",
+            labelnames=["namespace"],
+        )
+
+        # Histogram: restore duration
+        self.restore_duration = Histogram(
+            "postgres_operator_restore_duration_seconds",
+            "Time taken for a restore operation",
+            labelnames=["namespace"],
+            buckets=[10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+        )
+
     def start_metrics_server(self):
         """
         Start the HTTP server that exposes /metrics.
