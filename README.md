@@ -14,28 +14,29 @@ graph TB
     end
 
     subgraph "Operator Pod"
-        OP[postgres-operator<br>(kopf)]
+        OP["postgres-operator (kopf)"]
         METRICS[/metrics :8080/]
     end
 
     subgraph "Managed Resources"
         CRD_MPG[ManagedPostgres CRD]
         CRD_PGR[PostgresRestore CRD]
-        MPG[ManagedPostgres<br>my-app-db]
-        PGR[PostgresRestore<br>restore-1]
+        MPG[ManagedPostgres my-app-db]
+        PGR[PostgresRestore restore-1]
     end
 
     subgraph "Database Resources"
-        SEC[Secret<br>credentials]
-        PVC[PVC<br>postgres-data]
-        STS[StatefulSet<br>postgres]
-        SVC[Service<br>postgres]
-        CJ[CronJob<br>backup]
+        SEC[Secret credentials]
+        PVC[PVC postgres-data]
+        STS[StatefulSet postgres]
+        SVC[Service postgres]
+        CJ[CronJob backup]
     end
 
-    subgraph "Backup/Restore"
-        BC[Backup Container<br>pg_dump to S3 or Local]
-        RC[Restore Job<br>psql from S3 or Local]
+    subgraph "Backup and Restore"
+        BC[Backup Container - pg_dump]
+        RC[Restore Job - psql]
+        BKPVC[Backup PVC backup-data]
     end
 
     subgraph "Observability"
@@ -57,6 +58,9 @@ graph TB
     MPG -->|ownerRef| SVC
     MPG -->|ownerRef| CJ
     CJ -->|schedule| BC
+    BC -->|dump to| BKPVC
+    RC -->|reads| BKPVC
+    OP -->|auto-create on data loss| PGR
     PGR -->|create| RC
     RC -->|restore| STS
     BC -->|pg_dump| STS
