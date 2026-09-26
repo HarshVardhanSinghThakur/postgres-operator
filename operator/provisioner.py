@@ -55,7 +55,9 @@ from config import (
     LABEL_MANAGED_BY, COMPONENT_DB, COMPONENT_BACKUP,
     DEFAULT_CPU_REQUEST, DEFAULT_MEMORY_REQUEST,
     DEFAULT_CPU_LIMIT, DEFAULT_MEMORY_LIMIT,
+    DEFAULT_BACKUP_STORAGE, LOCAL_BACKUP_PATH,
     resource_labels, postgres_image,
+    backup_data_pvc_name,
 )
 from metrics import METRICS
 
@@ -248,6 +250,10 @@ class Provisioner:
                 annotations=self.annotations,
                 owner_references=[self.owner_ref],
             ),
+            # Immutable: data can never be changed after creation, only
+            # metadata. Protects credentials from accidental modification.
+            # (Metadata patches in the update path above are still allowed.)
+            immutable=True,
             # string_data: K8s base64-encodes these for us
             string_data={
                 "POSTGRES_USER":     "postgres",
@@ -560,32 +566,68 @@ class Provisioner:
         logger.info(f"Service {self.name}: created")
         return "created", result
 
-    # ── Backup CronJob ────────────────────────────────────────────────────────
+    # ── Backup data PVC ─────────────────────────────────────────────────────
 
-    def ensure_backup_cronjob(self, backup_image: str) -> tuple[str, object]:
+    def ensure_backup_data_pvc(self) -> tuple[str, object]:
         """
-        Ensure a CronJob exists that runs backups on schedule.
+        Ensure the dedicated backup-data PVC exists (local backend only).
 
-        The CronJob spins up a backup container that:
-          1. Runs pg_dump against our Postgres pod
-          2. Compresses the output
-          3. Saves to local PVC or uploads to S3
+        CRITICAL: this PVC is created WITHOUT an owner reference on purpose.
+        Backup CronJobs and restore Jobs mount it at /backups. When the
+        ManagedPostgres is deleted, K8s garbage-collects owned resources —
+        but this PVC survives, so a later instance with the same name can
+        restore from the retained backups. This is what makes
+        "delete database → restore everything" work.
 
-        backup_image: Docker image containing our backup script.
-                      Built from backup/Dockerfile.
-
-        CronJob name: <instance-name>-backup
+        PVC name: <instance-name>-backup-data
+        Returns ("created" | "exists", pvc). "exists" (not "unchanged") signals
+        a pre-existing PVC — callers use this to decide on auto-restore.
         """
-        cj_name  = f"{self.name}-backup"
-        schedule = self.spec.get("backupSchedule", "0 2 * * *")
-        backend  = self.spec.get("backupBackend", "local")
+        pvc_name = backup_data_pvc_name(self.name)
+        storage  = self.spec.get("backupStorage", DEFAULT_BACKUP_STORAGE)
+        existing = resource_exists(
+            self.core_v1.read_namespaced_persistent_volume_claim,
+            pvc_name, self.namespace
+        )
 
-        # Env vars passed to the backup container
+        if existing:
+            logger.debug(f"Backup PVC {pvc_name}: exists")
+            return "exists", existing
+
+        pvc = client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(
+                name=pvc_name,
+                namespace=self.namespace,
+                labels=resource_labels(self.name, COMPONENT_BACKUP),
+                # NOTE: no owner_references — must survive CR deletion.
+            ),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1ResourceRequirements(
+                    requests={"storage": storage}
+                ),
+            ),
+        )
+
+        result = self.core_v1.create_namespaced_persistent_volume_claim(
+            self.namespace, pvc
+        )
+        record_api_call("create", "pvc", True)
+        logger.info(f"Backup PVC {pvc_name}: created ({storage})")
+        return "created", result
+
+    # ── Backup container spec builders (shared by CronJob + final Job) ──────
+
+    def _backup_env_vars(self) -> list:
+        """Env vars passed to the backup container."""
+        backend = self.spec.get("backupBackend", "local")
+        retention = str(self.spec.get("backupRetentionDays", 7))
+
         env_vars = [
             client.V1EnvVar(name="DB_NAME",    value=self.name),
             client.V1EnvVar(name="NAMESPACE",  value=self.namespace),
             client.V1EnvVar(name="BACKEND",    value=backend),
-            client.V1EnvVar(name="RETENTION_DAYS", value="7"),
+            client.V1EnvVar(name="RETENTION_DAYS", value=retention),
             # Postgres credentials from the Secret
             client.V1EnvVar(
                 name="POSTGRES_HOST",
@@ -629,6 +671,70 @@ class Provisioner:
                 ),
             ]
 
+        return env_vars
+
+    def _backup_volumes(self) -> list:
+        """
+        Volumes for backup pods. Local backend mounts the dedicated backup-data
+        PVC at /backups so backups survive pod restarts. S3 needs no volumes
+        (boto3 streams straight to the bucket).
+        """
+        if self.spec.get("backupBackend", "local") == "s3":
+            return []
+        return [
+            client.V1Volume(
+                name="backup-store",
+                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                    claim_name=backup_data_pvc_name(self.name)
+                ),
+            )
+        ]
+
+    def _backup_volume_mounts(self) -> list:
+        """Volume mounts for the backup container (pairs with _backup_volumes)."""
+        if self.spec.get("backupBackend", "local") == "s3":
+            return []
+        return [
+            client.V1VolumeMount(
+                name="backup-store",
+                mount_path=LOCAL_BACKUP_PATH,   # /backups — matches backup.py LocalBackend
+            )
+        ]
+
+    def _backup_pod_spec(self, backup_image: str, labels: dict) -> client.V1PodSpec:
+        """PodSpec for one backup run. Shared by the CronJob and the final-backup Job."""
+        return client.V1PodSpec(
+            restart_policy="OnFailure",
+            containers=[
+                client.V1Container(
+                    name="backup",
+                    image=backup_image,
+                    env=self._backup_env_vars(),
+                    volume_mounts=self._backup_volume_mounts(),
+                )
+            ],
+            volumes=self._backup_volumes(),
+        )
+
+    # ── Backup CronJob ────────────────────────────────────────────────────────
+
+    def ensure_backup_cronjob(self, backup_image: str) -> tuple[str, object]:
+        """
+        Ensure a CronJob exists that runs backups on schedule.
+
+        The CronJob spins up a backup container that:
+          1. Runs pg_dump against our Postgres pod
+          2. Compresses the output
+          3. Saves to the backup-data PVC (local) or uploads to S3
+
+        backup_image: resolved via config.backup_image_for_spec() by the caller.
+
+        CronJob name: <instance-name>-backup
+        """
+        cj_name  = f"{self.name}-backup"
+        schedule = self.spec.get("backupSchedule", "0 2 * * *")
+        backend  = self.spec.get("backupBackend", "local")
+
         backup_labels = resource_labels(self.name, COMPONENT_BACKUP)
 
         cronjob_body = client.V1CronJob(
@@ -649,16 +755,7 @@ class Provisioner:
                         backoff_limit=2,           # retry failed backup up to 2 times
                         template=client.V1PodTemplateSpec(
                             metadata=client.V1ObjectMeta(labels=backup_labels),
-                            spec=client.V1PodSpec(
-                                restart_policy="OnFailure",
-                                containers=[
-                                    client.V1Container(
-                                        name="backup",
-                                        image=backup_image,
-                                        env=env_vars,
-                                    )
-                                ],
-                            ),
+                            spec=self._backup_pod_spec(backup_image, backup_labels),
                         ),
                     ),
                 ),
@@ -688,6 +785,36 @@ class Provisioner:
         record_api_call("create", "cronjob", True)
         logger.info(f"CronJob {cj_name}: created (schedule={schedule}, backend={backend})")
         return "created", result
+
+    def build_final_backup_job(self, backup_image: str, job_name: str) -> client.V1Job:
+        """
+        Build a one-shot final backup Job (used by the delete handler).
+
+        IMPORTANT: no owner reference — it must survive the ManagedPostgres
+        deletion so the backup actually completes. The backup-data PVC is also
+        ownerless, so the dump file is retained for a later restore.
+        """
+        backup_labels = resource_labels(self.name, COMPONENT_BACKUP)
+
+        return client.V1Job(
+            metadata=client.V1ObjectMeta(
+                name=job_name,
+                namespace=self.namespace,
+                labels=backup_labels,
+                annotations={
+                    "db.harshdev.io/final-backup-for": self.name,
+                },
+                # NOTE: no owner_references — must outlive the CR being deleted.
+            ),
+            spec=client.V1JobSpec(
+                backoff_limit=1,
+                ttl_seconds_after_finished=86400,   # keep a day for debugging
+                template=client.V1PodTemplateSpec(
+                    metadata=client.V1ObjectMeta(labels=backup_labels),
+                    spec=self._backup_pod_spec(backup_image, backup_labels),
+                ),
+            ),
+        )
 
     def endpoint(self) -> str:
         """DNS endpoint for this database instance."""
