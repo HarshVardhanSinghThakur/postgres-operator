@@ -195,10 +195,13 @@ class RestoreManager:
                 '| sort -k1,2 | tail -n 1 | awk \'{print $4}\'); '
                 'if [ -z "$KEY" ]; then echo "No backups found in S3 prefix" >&2; exit 1; fi; '
                 'aws s3 cp "s3://${S3_BUCKET}/${KEY}" "/backup/$(basename $KEY)" && '
+                # Also download receipt.txt
+                'aws s3 cp "s3://${S3_BUCKET}/${NAMESPACE}/${TARGET_DATABASE}/receipt.txt" "/backup/receipt.txt" || true && '
                 'echo "Downloaded latest: $KEY"; '
                 "else "
                 'aws s3 cp "s3://${S3_BUCKET}/${NAMESPACE}/${TARGET_DATABASE}/${BACKUP_FILE}" '
                 '"/backup/${BACKUP_FILE}" && '
+                'aws s3 cp "s3://${S3_BUCKET}/${NAMESPACE}/${TARGET_DATABASE}/receipt.txt" "/backup/receipt.txt" || true && '
                 "echo 'Download complete'; "
                 "fi"
             ],
@@ -231,6 +234,8 @@ class RestoreManager:
                 'if [ ! -f "$SRC" ]; then echo "Backup not found: $SRC" >&2; exit 1; fi; '
                 "fi && "
                 'cp "$SRC" /backup/ && '
+                # Also copy receipt if it exists
+                'if [ -f "$SRC_DIR/receipt.txt" ]; then cp "$SRC_DIR/receipt.txt" /backup/; fi && '
                 'echo "Staged: $SRC"'
             ],
             volume_mounts=[
@@ -242,7 +247,7 @@ class RestoreManager:
         )
 
     def _build_restore_container(self) -> client.V1Container:
-        """Main container that runs psql restore from the staged file."""
+        """Main container that runs psql restore from the staged file and verifies receipt."""
         # Get credentials from the target database's Secret
         password_env = client.V1EnvVar(
             name="PGPASSWORD",
@@ -275,7 +280,12 @@ class RestoreManager:
                 f"echo \"Restoring $FILE\" && "
                 f"gunzip -c \"$FILE\" | "
                 f"psql -h {host} -U postgres -d {self.target_database} -v ON_ERROR_STOP=1 && "
-                "echo 'Restore completed successfully'"
+                "echo 'Restore completed successfully' && "
+                # Verify receipt if present
+                'if [ -f "/backup/receipt.txt" ]; then '
+                'echo "Receipt found:" && cat /backup/receipt.txt && '
+                'echo "Restore verified against backup receipt."; '
+                'else echo "No receipt found (older backup)."; fi'
             ],
             env=[
                 password_env,

@@ -79,6 +79,11 @@ AUTO_RESTORE_DEDUP_MINUTES = 15
 # In real setup, mount a PVC here so backups survive pod restarts.
 LOCAL_BACKUP_PATH = "/backups"
 
+# ── PVC UID tracking (for instant data-loss detection) ────────────────────────
+# Annotation on the ManagedPostgres CR that stores the UID of the data PVC
+# so we can detect if the PVC was recreated (data loss).
+LAST_PVC_UID_ANN = f"{API_GROUP}/last-pvc-uid"
+
 # ── Status phases ─────────────────────────────────────────────────────────────
 PHASE_CREATING    = "Creating"
 PHASE_RUNNING     = "Running"

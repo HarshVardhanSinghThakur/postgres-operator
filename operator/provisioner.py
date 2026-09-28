@@ -58,6 +58,7 @@ from config import (
     DEFAULT_BACKUP_STORAGE, LOCAL_BACKUP_PATH,
     resource_labels, postgres_image,
     backup_data_pvc_name,
+    LAST_PVC_UID_ANN,
 )
 from metrics import METRICS
 
@@ -347,7 +348,8 @@ class Provisioner:
         )
         record_api_call("create", "pvc", True)
         logger.info(f"PVC {pvc_name}: created ({storage})")
-        return "created", result
+        # Return the PVC UID so callers can track it for data-loss detection
+        return "created", result.metadata.uid
 
     # ── StatefulSet ───────────────────────────────────────────────────────────
 

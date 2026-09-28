@@ -50,6 +50,7 @@ from config import (
     FINALIZER,
     AUTO_RESTORE_LABEL, AUTO_RESTORE_DEDUP_MINUTES,
     backup_image_for_spec,
+    LAST_PVC_UID_ANN,
 )
 from metrics import METRICS
 from provisioner import Provisioner
@@ -57,6 +58,37 @@ from status import StatusManager
 from restore import RestoreManager
 
 logger = logging.getLogger(__name__)
+
+
+def emit_event(namespace: str, name: str, event_type: str, reason: str, message: str):
+    """
+    Create a Kubernetes Event tied to the ManagedPostgres CR.
+    This provides visible step-by-step feedback for demos/observability.
+    """
+    try:
+        core_v1 = k8s_client.CoreV1Api()
+        event = k8s_client.V1Event(
+            metadata=k8s_client.V1ObjectMeta(
+                generateName=f"{name}-",
+                namespace=namespace,
+            ),
+            involved_object=k8s_client.V1ObjectReference(
+                apiVersion=f"{API_GROUP}/{API_VERSION}",
+                kind="ManagedPostgres",
+                name=name,
+                namespace=namespace,
+            ),
+            reason=reason,
+            message=message,
+            type=event_type,
+            first_timestamp=datetime.now(timezone.utc).isoformat() + "Z",
+            last_timestamp=datetime.now(timezone.utc).isoformat() + "Z",
+            count=1,
+        )
+        core_v1.create_namespaced_event(namespace, event)
+        logger.info(f"[{name}] Event emitted: {reason} — {message}")
+    except Exception as e:
+        logger.warning(f"[{name}] Failed to emit event {reason}: {e}")
 
 
 # ── Finalizer + auto-restore helpers ──────────────────────────────────────────
@@ -254,9 +286,30 @@ def on_create(spec, meta, status, patch, **kwargs):
         logger.info(f"[{name}] Secret: {action}")
         sm.set_condition(CONDITION_STORAGE_READY, "False", "PVCPending", "Creating PVC")
 
-        action, _ = p.ensure_pvc()
+        action, pvc_result = p.ensure_pvc()
         logger.info(f"[{name}] PVC: {action}")
         sm.set_condition(CONDITION_STORAGE_READY, "True", "PVCCreated", "PVC created")
+        # If PVC was created (not updated/unchanged), store its UID for data-loss detection
+        if action == "created" and hasattr(pvc_result, 'metadata') and hasattr(pvc_result.metadata, 'uid'):
+            pvc_uid = pvc_result.metadata.uid
+        elif action == "created":
+            # pvc_result is the UID string (new return format)
+            pvc_uid = pvc_result
+        else:
+            pvc_uid = None
+        
+        if pvc_uid:
+            # Store the PVC UID in the CR's metadata annotations via direct API patch
+            try:
+                api = _custom_api()
+                api.patch_namespaced_custom_object(
+                    group=API_GROUP, version=API_VERSION,
+                    namespace=namespace, plural="managedpostgres", name=name,
+                    body={"metadata": {"annotations": {LAST_PVC_UID_ANN: pvc_uid}}}
+                )
+                logger.info(f"[{name}] Stored PVC UID for data-loss detection: {pvc_uid}")
+            except Exception as e:
+                logger.warning(f"[{name}] Failed to store PVC UID annotation: {e}")
 
         action, _ = p.ensure_statefulset()
         logger.info(f"[{name}] StatefulSet: {action}")
@@ -521,6 +574,36 @@ def reconcile(spec, meta, status, patch, **kwargs):
         # Re-assert finalizer (self-heals objects created before finalizer support).
         ensure_finalizer(namespace, name, meta.get("finalizers"))
 
+        # --- UID-based data-loss detection -----------------------------------
+        stored_uid = (meta.get("annotations") or {}).get(LAST_PVC_UID_ANN)
+        if stored_uid:
+            try:
+                current_pvc = p.core_v1.read_namespaced_persistent_volume_claim(
+                    f"{name}-data", namespace
+                )
+                current_uid = current_pvc.metadata.uid
+                if stored_uid != current_uid:
+                    # PVC was recreated → data loss
+                    logger.warning(f"[{name}] PVC UID changed! Stored: {stored_uid}, Current: {current_uid}")
+                    emit_event(namespace, name,
+                               event_type="Warning", reason="DataLoss",
+                               message="Data PVC recreated; data loss detected.")
+                    # Update stored UID to the new one
+                    try:
+                        api = _custom_api()
+                        api.patch_namespaced_custom_object(
+                            group=API_GROUP, version=API_VERSION,
+                            namespace=namespace, plural="managedpostgres", name=name,
+                            body={"metadata": {"annotations": {LAST_PVC_UID_ANN: current_uid}}}
+                        )
+                    except Exception as e:
+                        logger.warning(f"[{name}] Failed to update PVC UID annotation: {e}")
+                    # Trigger auto-restore from backup
+                    maybe_auto_restore(namespace, name, spec, reason="PVC-UID-change")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"[{name}] Could not read PVC for UID check: {e.reason}")
+
         results = {
             "secret":      p.ensure_secret()[0],
             "pvc":         p.ensure_pvc()[0],
@@ -613,6 +696,9 @@ def on_restore_create(spec, meta, status, patch, **kwargs):
             patch.status["jobName"] = job.metadata.name
             METRICS.restores_started.labels(namespace=namespace).inc()
             logger.info(f"[{name}] Restore Job created: {job.metadata.name}")
+            emit_event(namespace, target_database,
+                       event_type="Normal", reason="RestoreStarted",
+                       message=f"Restore of {target_database} from {backup_file} started.")
         else:
             patch.status["phase"] = "Running"
             patch.status["message"] = f"Restore Job already exists"
@@ -623,6 +709,9 @@ def on_restore_create(spec, meta, status, patch, **kwargs):
         patch.status["message"] = f"Failed to create restore Job: {e}"
         METRICS.restores_failed.labels(namespace=namespace).inc()
         logger.exception(f"[{name}] Failed to create restore Job")
+        emit_event(namespace, target_database,
+                   event_type="Warning", reason="RestoreFailed",
+                   message=f"Failed to create restore Job: {e}")
         raise kopf.TemporaryError(str(e), delay=30)
 
 
@@ -659,10 +748,32 @@ def restore_reconcile(spec, meta, status, patch, **kwargs):
                 patch.status["completionTime"] = datetime.now(timezone.utc).isoformat()
                 METRICS.restores_completed.labels(namespace=namespace).inc()
                 logger.info(f"[{name}] Restore completed successfully")
+                # Emit RestoreVerified event
+                emit_event(namespace, target_db,
+                           event_type="Normal", reason="RestoreVerified",
+                           message="Restore completed successfully; backup receipt verified.")
+                # Emit RecoveryCompleted event with duration
+                start_time_str = status.get("startTime")
+                if start_time_str:
+                    try:
+                        start_time = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+                        recovery_seconds = (datetime.now(timezone.utc) - start_time).total_seconds()
+                        METRICS.restores_duration_seconds.labels(namespace=namespace).observe(recovery_seconds)
+                        emit_event(namespace, target_db,
+                                   event_type="Normal", reason="RecoveryCompleted",
+                                   message=f"Recovery completed in {recovery_seconds:.0f}s")
+                        # Update ManagedPostgres status message with recovery time
+                        # (best effort - just log it)
+                        logger.info(f"[{target_db}] Recovery took {recovery_seconds:.0f}s")
+                    except Exception:
+                        pass
             elif new_phase == "Failed":
                 patch.status["completionTime"] = datetime.now(timezone.utc).isoformat()
                 METRICS.restores_failed.labels(namespace=namespace).inc()
                 logger.error(f"[{name}] Restore failed: {message}")
+                emit_event(namespace, target_db,
+                           event_type="Warning", reason="RestoreFailed",
+                           message=f"Restore failed: {message}")
 
     except Exception as e:
         logger.error(f"[{name}] Restore reconcile error: {e}")

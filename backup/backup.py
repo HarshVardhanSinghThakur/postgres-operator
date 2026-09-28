@@ -35,6 +35,7 @@ ENV VARS (set by the CronJob in provisioner.py):
 """
 
 import gzip
+import hashlib
 import logging
 import os
 import shutil
@@ -285,6 +286,55 @@ def apply_retention(backend: BackupBackend, config: BackupConfig):
     return remaining
 
 
+def create_receipt(config: BackupConfig, dump_path: Path, backend: BackupBackend):
+    """
+    Create a receipt file with row count and checksum of the backup.
+    For local backend: writes receipt.txt to the backup directory.
+    For S3 backend: uploads receipt.txt to S3 alongside the backup.
+    """
+    try:
+        # Compute SHA256 checksum of the compressed dump
+        sha256_hash = hashlib.sha256()
+        with open(dump_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256_hash.update(chunk)
+        checksum = sha256_hash.hexdigest()
+
+        # Count rows (INSERT statements) in the dump
+        # Decompress and count INSERT lines
+        row_count = 0
+        import gzip as gz
+        with gz.open(dump_path, "rt", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("INSERT"):
+                    row_count += 1
+
+        receipt_content = f"rows={row_count} checksum={checksum}\n"
+
+        if config.backend == "local":
+            # Write receipt to the backup directory
+            db_path = Path(os.environ.get("LOCAL_BACKUP_PATH", "/backups")) / config.db_name
+            receipt_path = db_path / "receipt.txt"
+            with open(receipt_path, "w") as f:
+                f.write(receipt_content)
+            logger.info(f"Receipt created: {receipt_path} (rows={row_count})")
+        elif config.backend == "s3":
+            # Upload receipt to S3
+            import boto3
+            s3 = boto3.client("s3", region_name=config.s3_region)
+            key = f"{config.namespace}/{config.db_name}/receipt.txt"
+            s3.put_object(
+                Bucket=config.s3_bucket,
+                Key=key,
+                Body=receipt_content.encode(),
+                ServerSideEncryption="AES256",
+            )
+            logger.info(f"Receipt uploaded to S3: s3://{config.s3_bucket}/{key}")
+
+    except Exception as e:
+        logger.warning(f"Failed to create receipt (non-fatal): {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -313,7 +363,10 @@ def main():
         reference = backend.upload(tmp_path, config)
         logger.info(f"Backup stored at: {reference}")
 
-        # Step 3: enforce retention policy
+        # Step 3: create receipt (row count + checksum)
+        create_receipt(config, tmp_path, backend)
+
+        # Step 4: enforce retention policy
         remaining = apply_retention(backend, config)
 
         logger.info(

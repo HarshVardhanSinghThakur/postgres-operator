@@ -170,6 +170,14 @@ class OperatorMetrics:
             buckets=[10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
         )
 
+        # Histogram: recovery duration (time from data loss detection to recovery complete)
+        self.restores_duration_seconds = Histogram(
+            "postgres_operator_recovery_duration_seconds",
+            "Time taken for a full recovery (data loss to restore complete)",
+            labelnames=["namespace"],
+            buckets=[10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+        )
+
     def start_metrics_server(self):
         """
         Start the HTTP server that exposes /metrics.
