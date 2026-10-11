@@ -1,0 +1,20 @@
+{{- /*
+Metrics Service. The ServiceMonitor (and anything else that wants /metrics by
+DNS name) selects a Service, not a Pod; without this the operator was never scrapeable.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "postgres-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgres-operator.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "postgres-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP

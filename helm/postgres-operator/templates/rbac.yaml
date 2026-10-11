@@ -1,10 +1,16 @@
 {{- /*
 RBAC for postgres-operator.
-ServiceAccount + ClusterRole + ClusterRoleBinding.
+ServiceAccount + namespaced Role + RoleBinding.
+
+Namespaced, not cluster-scoped: main.py runs kopf.run(clusterwide=False), so
+the operator only ever watches/manages resources in its own release
+namespace. A ClusterRole here would grant it read/write on Secrets and PVCs
+in every namespace in the cluster for no operational benefit — pure blast
+radius with no corresponding capability.
 
 The operator manages: ManagedPostgres + PostgresRestore CRs (including
 status subresource and finalizers), and child resources: Secrets, PVCs,
-StatefulSets, Services, CronJobs, Jobs.
+StatefulSets, Services, CronJobs, Jobs — all within this namespace.
 */ -}}
 {{- if .Values.serviceAccount.create -}}
 apiVersion: v1
@@ -21,9 +27,10 @@ metadata:
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: {{ include "postgres-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "postgres-operator.labels" . | nindent 4 }}
 rules:
@@ -52,16 +59,28 @@ rules:
   - apiGroups: ["batch"]
     resources: ["cronjobs", "jobs"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: sync_backup_status() reads the backup pod's termination message
+  # (backup file count) to fill in status.backupCount and the backup metrics.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # k8s Events: emit_event() in main.py posts them directly, and kopf itself
+  # posts handler warnings/errors here (settings.posting.level). Without this
+  # rule every one of those posts 403s (caught and logged, but noisy/useless).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: {{ include "postgres-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "postgres-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: {{ include "postgres-operator.fullname" . }}
 subjects:
   - kind: ServiceAccount

@@ -36,6 +36,7 @@ ENV VARS (set by the CronJob in provisioner.py):
 
 import gzip
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -182,7 +183,8 @@ class S3Backend(BackupBackend):
     def list_backups(self, config: BackupConfig) -> list[str]:
         prefix   = f"{config.namespace}/{config.db_name}/"
         response = self.s3.list_objects_v2(Bucket=config.s3_bucket, Prefix=prefix)
-        objects  = response.get("Contents", [])
+        # Only dumps — the prefix also holds receipt.txt, which is not a backup
+        objects  = [o for o in response.get("Contents", []) if o["Key"].endswith(".sql.gz")]
         # Sort by LastModified, oldest first
         objects.sort(key=lambda o: o["LastModified"])
         # Return just the filename part (strip prefix)
@@ -300,13 +302,22 @@ def create_receipt(config: BackupConfig, dump_path: Path, backend: BackupBackend
                 sha256_hash.update(chunk)
         checksum = sha256_hash.hexdigest()
 
-        # Count rows (INSERT statements) in the dump
-        # Decompress and count INSERT lines
+        # Count rows in the plain-SQL dump. pg_dump writes table data as
+        # "COPY t (...) FROM stdin;" blocks (one line per row) terminated by
+        # a "\." line, so count lines inside those blocks; INSERT statements
+        # (only present with --inserts) count one row each.
         row_count = 0
-        import gzip as gz
-        with gz.open(dump_path, "rt", encoding="utf-8", errors="ignore") as f:
+        in_copy = False
+        with gzip.open(dump_path, "rt", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if line.startswith("INSERT"):
+                if in_copy:
+                    if line.rstrip("\r\n") == "\\.":
+                        in_copy = False
+                    else:
+                        row_count += 1
+                elif line.startswith("COPY ") and line.rstrip().endswith("FROM stdin;"):
+                    in_copy = True
+                elif line.startswith("INSERT INTO"):
                     row_count += 1
 
         receipt_content = f"rows={row_count} checksum={checksum}\n"
@@ -373,6 +384,13 @@ def main():
             f"Backup complete: {config.filename} "
             f"({remaining} backups retained)"
         )
+
+        # The operator reads this from the Pod's terminated state to fill in
+        # status.backupCount — this container has no Kubernetes API access.
+        try:
+            Path("/dev/termination-log").write_text(json.dumps({"files": remaining}))
+        except OSError as e:
+            logger.warning(f"Could not write termination message (non-fatal): {e}")
         sys.exit(0)
 
     except Exception as e:

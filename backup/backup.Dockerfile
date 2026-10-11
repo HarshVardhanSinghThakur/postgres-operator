@@ -16,10 +16,10 @@ WORKDIR /app
 # Install Python deps
 # boto3 is included but only used if BACKEND=s3
 # If you never use S3, this adds ~10MB — acceptable tradeoff
-COPY backup/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY backup/backup.py .
+COPY backup.py .
 
 # Non-root user
 RUN addgroup -S backup && adduser -S backup -G backup

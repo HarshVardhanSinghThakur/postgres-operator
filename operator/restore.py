@@ -218,6 +218,12 @@ class RestoreManager:
         The backup-store volume is the dedicated <instance>-backup-data PVC
         created by Provisioner.ensure_backup_data_pvc (same PVC the CronJob
         writes to). backupFile "latest" picks the newest dump at runtime.
+
+        SECURITY: target_database/backup_file come from a user-controlled CR
+        and must never be spliced into the shell script text itself (that's
+        shell injection). They're passed as env vars instead and referenced
+        as $TARGET_DATABASE/$WANT — the shell treats their contents as data,
+        not syntax.
         """
         return client.V1Container(
             name="copy-backup",
@@ -225,8 +231,8 @@ class RestoreManager:
             command=["sh", "-c"],
             args=[
                 "set -e && mkdir -p /backup && "
-                f'SRC_DIR="{LOCAL_BACKUP_PATH}/{self.target_database}" && '
-                f'WANT="{self.backup_file}" && '
+                f'SRC_DIR="{LOCAL_BACKUP_PATH}/$TARGET_DATABASE" && '
+                'WANT="$BACKUP_FILE" && '
                 'if [ "$WANT" = "latest" ]; then '
                 'SRC=$(ls -t "$SRC_DIR"/*.sql.gz 2>/dev/null | head -n 1); '
                 'if [ -z "$SRC" ]; then echo "No backups found in $SRC_DIR" >&2; exit 1; fi; '
@@ -238,6 +244,10 @@ class RestoreManager:
                 'if [ -f "$SRC_DIR/receipt.txt" ]; then cp "$SRC_DIR/receipt.txt" /backup/; fi && '
                 'echo "Staged: $SRC"'
             ],
+            env=[
+                client.V1EnvVar(name="TARGET_DATABASE", value=self.target_database),
+                client.V1EnvVar(name="BACKUP_FILE", value=self.backup_file),
+            ],
             volume_mounts=[
                 client.V1VolumeMount(name="backup-data", mount_path="/backup"),
                 client.V1VolumeMount(
@@ -247,7 +257,14 @@ class RestoreManager:
         )
 
     def _build_restore_container(self) -> client.V1Container:
-        """Main container that runs psql restore from the staged file and verifies receipt."""
+        """
+        Main container that runs psql restore from the staged file and verifies receipt.
+
+        SECURITY: as in _build_local_copy_container, target_database/backup_file
+        are user-controlled and must reach the shell only via env vars, never
+        spliced into the script text. host is derived from target_database so
+        it's passed through as an env var too.
+        """
         # Get credentials from the target database's Secret
         password_env = client.V1EnvVar(
             name="PGPASSWORD",
@@ -268,18 +285,18 @@ class RestoreManager:
             args=[
                 "set -e && "
                 "echo 'Waiting for Postgres to be ready...' && "
-                f"until pg_isready -h {host} -U postgres; do sleep 2; done && "
+                'until pg_isready -h "$POSTGRES_HOST" -U postgres; do sleep 2; done && '
                 "echo 'Starting restore...' && "
                 # With backupFile "latest" the initContainer staged exactly one
                 # file; otherwise use the requested filename.
-                f'FILE="/backup/{self.backup_file}" && '
+                'FILE="/backup/$BACKUP_FILE" && '
                 'if [ ! -f "$FILE" ]; then '
                 'FILE=$(ls -t /backup/*.sql.gz 2>/dev/null | head -n 1); '
                 'if [ -z "$FILE" ]; then echo "No staged backup in /backup" >&2; exit 1; fi; '
                 "fi && "
-                f"echo \"Restoring $FILE\" && "
-                f"gunzip -c \"$FILE\" | "
-                f"psql -h {host} -U postgres -d {self.target_database} -v ON_ERROR_STOP=1 && "
+                'echo "Restoring $FILE" && '
+                'gunzip -c "$FILE" | '
+                'psql -h "$POSTGRES_HOST" -U postgres -d "$TARGET_DATABASE" -v ON_ERROR_STOP=1 && '
                 "echo 'Restore completed successfully' && "
                 # Verify receipt if present
                 'if [ -f "/backup/receipt.txt" ]; then '
@@ -290,6 +307,8 @@ class RestoreManager:
             env=[
                 password_env,
                 client.V1EnvVar(name="BACKUP_FILE", value=self.backup_file),
+                client.V1EnvVar(name="TARGET_DATABASE", value=self.target_database),
+                client.V1EnvVar(name="POSTGRES_HOST", value=host),
             ],
             volume_mounts=[
                 client.V1VolumeMount(name="backup-data", mount_path="/backup", read_only=True),

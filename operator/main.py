@@ -33,6 +33,7 @@ ERROR HANDLING STRATEGY:
   This is what "failure handling" means at the operator level.
 """
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ from config import (
     PHASE_RUNNING, PHASE_DEGRADED,
     CONDITION_DATABASE_READY, CONDITION_BACKUP_CONFIGURED, CONDITION_STORAGE_READY,
     RETRY_INITIAL_DELAY,
+    RECONCILE_INTERVAL,
     FINALIZER,
     AUTO_RESTORE_LABEL, AUTO_RESTORE_DEDUP_MINUTES,
     backup_image_for_spec,
@@ -214,6 +216,121 @@ def maybe_auto_restore(namespace: str, name: str, spec: dict, reason: str):
         logger.warning(f"[{name}] Auto-restore failed (non-fatal): {e.reason}")
         return None
 
+
+# ── Backup status sync ────────────────────────────────────────────────────────
+
+# (namespace, name) -> {"seen": UIDs of finished backup Jobs already counted,
+#                       "files": (Job UID, backup file count) of the newest success}
+_backup_state: dict = {}
+
+
+def _job_outcome(job) -> str | None:
+    """'success' or 'failed' once a Job is finished; None while running/retrying."""
+    for c in (job.status.conditions or []):
+        if c.status == "True" and c.type == "Complete":
+            return "success"
+        if c.status == "True" and c.type == "Failed":
+            return "failed"
+    return None
+
+
+def _backup_file_count(namespace: str, job) -> int | None:
+    """Backup count the backup container reported in its termination message."""
+    pods = k8s_client.CoreV1Api().list_namespaced_pod(
+        namespace, label_selector=f"job-name={job.metadata.name}"
+    ).items
+    for pod in pods:
+        for cs in (pod.status.container_statuses or []):
+            term = cs.state.terminated if cs.state else None
+            if term and term.message:
+                try:
+                    return int(json.loads(term.message)["files"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+    return None
+
+
+def sync_backup_status(namespace: str, name: str, spec: dict, status, patch):
+    """
+    Turn the backup CronJob's finished Jobs into metrics and
+    status.lastBackup / status.backupCount.
+
+    The backup runs in its own pod and can't touch operator metrics, so the
+    operator observes the results from outside. Best-effort — never raises.
+    """
+    backend = spec.get("backupBackend", "local")
+    try:
+        cronjob = f"{name}-backup"
+        jobs = [
+            j for j in k8s_client.BatchV1Api().list_namespaced_job(namespace).items
+            if any(o.kind == "CronJob" and o.name == cronjob
+                   for o in (j.metadata.owner_references or []))
+        ]
+
+        # Referencing the labels creates both counter series at 0, so
+        # increase() in the alert rules sees the first failure.
+        succeeded = METRICS.backups_success.labels(namespace=namespace, instance=name, backend=backend)
+        failed    = METRICS.backups_failed.labels(namespace=namespace, instance=name, backend=backend)
+
+        # The first look after an operator (re)start only records existing Jobs:
+        # counting old results would re-fire PostgresBackupFailed on every restart.
+        first = (namespace, name) not in _backup_state
+        state = _backup_state.setdefault((namespace, name), {"seen": set(), "files": None})
+
+        latest = None
+        for job in jobs:
+            outcome = _job_outcome(job)
+            if outcome is None:
+                continue
+            if job.metadata.uid not in state["seen"]:
+                state["seen"].add(job.metadata.uid)
+                if not first:
+                    (succeeded if outcome == "success" else failed).inc()
+            done = job.status.completion_time
+            if outcome == "success" and done and (
+                latest is None or done > latest.status.completion_time
+            ):
+                latest = job
+
+        if latest is None:
+            return
+
+        finished = latest.status.completion_time
+        METRICS.last_backup_timestamp.labels(namespace=namespace, instance=name).set(finished.timestamp())
+
+        if state["files"] is None or state["files"][0] != latest.metadata.uid:
+            state["files"] = (latest.metadata.uid, _backup_file_count(namespace, latest))
+        count = state["files"][1]
+        if count is not None:
+            METRICS.backup_count.labels(namespace=namespace, instance=name).set(count)
+
+        last_backup = finished.isoformat()
+        if last_backup != status.get("lastBackup") or (
+            count is not None and count != status.get("backupCount")
+        ):
+            StatusManager(namespace, name, patch, status).set_backup_info(last_backup, count)
+    except Exception as e:
+        logger.warning(f"[{name}] Backup status sync failed (non-fatal): {e}")
+
+
+def forget_backup_metrics(namespace: str, name: str, backend: str):
+    """
+    Drop a deleted instance's backup series. Otherwise its last-backup gauge
+    freezes and PostgresBackupStale fires forever.
+    """
+    _backup_state.pop((namespace, name), None)
+    for metric, labels in (
+        (METRICS.backups_success, (namespace, name, backend)),
+        (METRICS.backups_failed, (namespace, name, backend)),
+        (METRICS.last_backup_timestamp, (namespace, name)),
+        (METRICS.backup_count, (namespace, name)),
+    ):
+        try:
+            metric.remove(*labels)
+        except KeyError:
+            pass
+
+
 # ── Operator startup ──────────────────────────────────────────────────────────
 
 @kopf.on.startup()
@@ -289,15 +406,10 @@ def on_create(spec, meta, status, patch, **kwargs):
         action, pvc_result = p.ensure_pvc()
         logger.info(f"[{name}] PVC: {action}")
         sm.set_condition(CONDITION_STORAGE_READY, "True", "PVCCreated", "PVC created")
-        # If PVC was created (not updated/unchanged), store its UID for data-loss detection
-        if action == "created" and hasattr(pvc_result, 'metadata') and hasattr(pvc_result.metadata, 'uid'):
-            pvc_uid = pvc_result.metadata.uid
-        elif action == "created":
-            # pvc_result is the UID string (new return format)
-            pvc_uid = pvc_result
-        else:
-            pvc_uid = None
-        
+        # ensure_pvc() returns the new PVC's UID string on "created"; store it
+        # for data-loss detection (recreated PVC = different UID = data loss).
+        pvc_uid = pvc_result if action == "created" else None
+
         if pvc_uid:
             # Store the PVC UID in the CR's metadata annotations via direct API patch
             try:
@@ -521,6 +633,8 @@ def on_delete(spec, meta, status, patch, **kwargs):
     # Unblock deletion regardless of backup outcome.
     remove_finalizer(namespace, name)
 
+    forget_backup_metrics(namespace, name, spec.get("backupBackend", "local"))
+
     # Decrement the running instance gauge
     METRICS.instances_total.labels(namespace=namespace, phase=PHASE_RUNNING).dec()
     METRICS.instances_deleted.labels(namespace=namespace).inc()
@@ -534,7 +648,7 @@ def on_delete(spec, meta, status, patch, **kwargs):
 
 # ── RECONCILIATION TIMER ──────────────────────────────────────────────────────
 
-@kopf.timer(API_GROUP, API_VERSION, "managedpostgres", interval=60.0, sharp=True)
+@kopf.timer(API_GROUP, API_VERSION, "managedpostgres", interval=RECONCILE_INTERVAL, sharp=True)
 def reconcile(spec, meta, status, patch, **kwargs):
     """
     Runs every 60 seconds for every ManagedPostgres instance.
@@ -629,6 +743,9 @@ def reconcile(spec, meta, status, patch, **kwargs):
                 # Data PVC was gone and got recreated empty → data loss.
                 # Backups live in the surviving backup-data PVC → auto-restore.
                 maybe_auto_restore(namespace, name, spec, reason="data-pvc-recreated")
+
+        if spec.get("backupEnabled", False):
+            sync_backup_status(namespace, name, spec, status, patch)
 
         duration = time.monotonic() - start
         result   = "healed" if drifted else "noop"

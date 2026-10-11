@@ -29,9 +29,13 @@ spec:
                 targetDatabase:
                   type: string
                   description: "Name of the ManagedPostgres to restore into"
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                  maxLength: 253
                 backupFile:
                   type: string
                   description: "Backup filename to restore from, or 'latest' to auto-pick the newest backup"
+                  pattern: '^(latest|[A-Za-z0-9][A-Za-z0-9._-]*)$'
+                  maxLength: 255
             status:
               type: object
               properties:

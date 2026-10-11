@@ -22,3 +22,7 @@ helm/postgres-operator/charts/
 # Local secrets (never commit real credentials)
 *-creds.yaml
 secrets/
+
+# tool output that can contain a work email or usage data: never commit
+.codemie/
+docs/codemie/

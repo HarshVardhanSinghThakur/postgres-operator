@@ -5,6 +5,11 @@ Single source of truth for all labels, annotations, and defaults.
 If a value appears more than once in the codebase, it lives here.
 """
 
+import os
+
+# Seconds between reconcile passes per ManagedPostgres. Set by the Helm value reconcileInterval.
+RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "60"))
+
 # ── API group ────────────────────────────────────────────────────────────────
 API_GROUP    = "db.harshdev.io"
 API_VERSION  = "v1"
