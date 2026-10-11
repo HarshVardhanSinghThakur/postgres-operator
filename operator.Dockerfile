@@ -31,7 +31,7 @@ RUN python -m venv /venv \
 FROM python:3.11-alpine AS runtime
 
 # Non-root user — never run production containers as root
-RUN addgroup -S operator && adduser -S operator -G operator
+RUN addgroup -S -g 1000 operator && adduser -S -u 1000 -G operator operator
 
 WORKDIR /app
 

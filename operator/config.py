@@ -77,7 +77,7 @@ FINALIZER = f"{API_GROUP}/finalizer"
 # The restore Job resolves "latest" to the newest file at runtime.
 AUTO_RESTORE_ANNOTATION = f"{API_GROUP}/auto-restore"
 AUTO_RESTORE_LABEL = "postgres-restore-auto"
-AUTO_RESTORE_DEDUP_MINUTES = 15
+AUTO_RESTORE_DEDUP_MINUTES = float(os.environ.get("AUTO_RESTORE_DEDUP_MINUTES", "15"))
 
 # ── Local backup path (used when backupBackend = local) ───────────────────────
 # This path is inside the backup job container.

@@ -12,6 +12,10 @@ metadata:
     app.kubernetes.io/component: operator
 spec:
   replicas: {{ .Values.replicaCount }}
+  # Recreate, not RollingUpdate: this controller runs without leader election, so the old and new pod must
+  # never be alive together (both would reconcile the same objects and race, e.g. 409 on Job creation).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "postgres-operator.selectorLabels" . | nindent 6 }}
@@ -52,6 +56,8 @@ spec:
               value: "{{ .Values.metrics.port }}"
             - name: RECONCILE_INTERVAL
               value: "{{ .Values.reconcileInterval }}"
+            - name: AUTO_RESTORE_DEDUP_MINUTES
+              value: "{{ .Values.autoRestoreDedupMinutes }}"
           livenessProbe:
             httpGet:
               path: /metrics

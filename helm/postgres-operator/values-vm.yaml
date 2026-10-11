@@ -1,0 +1,18 @@
+# Overrides for the single-node k3s VM (images imported into containerd, no registry, no Prometheus Operator).
+#
+#   helm upgrade --install postgres-operator helm/postgres-operator -n portfolio -f helm/postgres-operator/values-vm.yaml \
+#     --set image.tag=<git-sha> --set backup.image=postgres-backup:<git-sha>
+#
+# Tags are passed on the command line because they change on every build. Never use "latest" for a locally imported
+# image: with a moving tag Kubernetes cannot tell a rebuilt image from the old one.
+image:
+  repository: postgres-operator
+
+# Fast loop so the live demo notices a deleted database within seconds.
+reconcileInterval: 10
+# Shorter than the site's 5-minute destroy cooldown, so the second deletion is also restored.
+autoRestoreDedupMinutes: 2
+
+# No Prometheus Operator on this cluster; the portfolio API scrapes the metrics Service directly.
+serviceMonitor:
+  enabled: false

@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -237,23 +238,31 @@ def run_pg_dump(config: BackupConfig, output_path: Path):
         "-U", "postgres",
         "-d", config.db_name,
         "-F", "p",         # plain SQL
+        # --clean --if-exists makes the dump DROP each object before creating it, so a restore also works into a
+        # database that already has some of them (e.g. an app recreated an empty table while the data was gone).
+        "--clean", "--if-exists",
         "--no-password",
     ]
 
     logger.info(f"Running pg_dump: {' '.join(pg_dump_cmd)}")
 
-    with gzip.open(output_path, "wb") as gz_file:
-        result = subprocess.run(
-            pg_dump_cmd,
-            stdout=gz_file,
-            stderr=subprocess.PIPE,
-            env=env,
-            timeout=3600,    # 1 hour max — for large databases
-        )
+    # Do NOT pass the GzipFile as stdout=: subprocess uses its raw file descriptor, so pg_dump would write
+    # uncompressed SQL straight to disk and bypass the compressor (the file is then a ".sql.gz" that gunzip
+    # rejects). Read pg_dump's stdout ourselves and feed it through the gzip writer instead.
+    # stderr goes to a temp file, not a pipe, so a chatty pg_dump can never block while we read stdout.
+    with tempfile.TemporaryFile() as err_file, gzip.open(output_path, "wb") as gz_file:
+        proc = subprocess.Popen(pg_dump_cmd, stdout=subprocess.PIPE, stderr=err_file, env=env)
+        try:
+            shutil.copyfileobj(proc.stdout, gz_file)
+            returncode = proc.wait(timeout=3600)    # 1 hour max — for large databases
+        except BaseException:
+            proc.kill()
+            raise
+        err_file.seek(0)
+        error = err_file.read().decode(errors="replace")
 
-    if result.returncode != 0:
-        error = result.stderr.decode()
-        raise RuntimeError(f"pg_dump failed (exit {result.returncode}): {error}")
+    if returncode != 0:
+        raise RuntimeError(f"pg_dump failed (exit {returncode}): {error}")
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     logger.info(f"pg_dump complete: {output_path} ({size_mb:.1f} MB)")

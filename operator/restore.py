@@ -36,6 +36,7 @@ from config import (
     COMPONENT_BACKUP,
     resource_labels,
     backup_data_pvc_name,
+    postgres_image,
 )
 from metrics import METRICS
 
@@ -280,12 +281,17 @@ class RestoreManager:
 
         return client.V1Container(
             name="restore",
-            image="postgres:15-alpine",
+            image=postgres_image(self.db_spec.get("version", "15")),   # same major as the server being restored into
             command=["sh", "-c"],
             args=[
-                "set -e && "
+                "set -e && set -o pipefail && "
                 "echo 'Waiting for Postgres to be ready...' && "
-                'until pg_isready -h "$POSTGRES_HOST" -U postgres; do sleep 2; done && '
+                # Wait for real queries to succeed three times in a row. A single pg_isready is not enough: a new
+                # Postgres container boots a temporary server, stops it and starts the real one, and the Service
+                # has no endpoint in between ("Connection refused" right after "accepting connections").
+                'n=0; until [ "$n" -ge 3 ]; do '
+                'if psql -h "$POSTGRES_HOST" -U postgres -d "$TARGET_DATABASE" -tAc "SELECT 1" >/dev/null 2>&1; '
+                'then n=$((n+1)); else n=0; fi; sleep 1; done && '
                 "echo 'Starting restore...' && "
                 # With backupFile "latest" the initContainer staged exactly one
                 # file; otherwise use the requested filename.

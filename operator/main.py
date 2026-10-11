@@ -35,6 +35,7 @@ ERROR HANDLING STRATEGY:
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -69,7 +70,10 @@ def emit_event(namespace: str, name: str, event_type: str, reason: str, message:
     """
     try:
         core_v1 = k8s_client.CoreV1Api()
-        event = k8s_client.V1Event(
+        # Newer clients renamed the core/v1 Event model (V1Event is now events.k8s.io); take whichever exists.
+        Event = getattr(k8s_client, "CoreV1Event", None) or k8s_client.V1Event
+        now = datetime.now(timezone.utc)
+        event = Event(
             metadata=k8s_client.V1ObjectMeta(
                 generateName=f"{name}-",
                 namespace=namespace,
@@ -83,8 +87,8 @@ def emit_event(namespace: str, name: str, event_type: str, reason: str, message:
             reason=reason,
             message=message,
             type=event_type,
-            first_timestamp=datetime.now(timezone.utc).isoformat() + "Z",
-            last_timestamp=datetime.now(timezone.utc).isoformat() + "Z",
+            first_timestamp=now,
+            last_timestamp=now,
             count=1,
         )
         core_v1.create_namespaced_event(namespace, event)
@@ -345,6 +349,10 @@ def on_startup(settings: kopf.OperatorSettings, **kwargs):
     settings.posting.level = logging.WARNING   # only post WARNING+ to K8s events
     settings.watching.connect_timeout = 30
     settings.watching.server_timeout  = 300    # re-establish watch every 5 min
+
+    # Do not scan for CRDs and namespaces cluster-wide. The namespaced Role deliberately cannot list those, and with a
+    # fixed namespace and the CRDs installed up front there is nothing left to discover (kopf's "minimal RBAC" mode).
+    settings.scanning.disabled = True
 
     # Start Prometheus metrics server on :8080/metrics
     METRICS.start_metrics_server()
@@ -918,4 +926,13 @@ if __name__ == "__main__":
         k8s_config.load_kube_config()
         logger.info("Using local kubeconfig (~/.kube/config)")
 
-    kopf.run(clusterwide=False)   # clusterwide=False = only watch current namespace
+    # kopf treats "no namespaces given" as CLUSTER-WIDE (clusterwide=False alone does not limit it), so name the
+    # namespace explicitly. The Helm chart sets OPERATOR_NAMESPACE to the pod's own namespace, which is also the
+    # only namespace the Role grants access to. standalone: one replica needs no peering (which would need extra
+    # cluster-level RBAC); identity: the pod name, so kopf never has to look up a username for the container's uid.
+    namespace = os.environ.get("OPERATOR_NAMESPACE")
+    identity = os.environ.get("OPERATOR_POD_NAME")
+    if namespace:
+        kopf.run(namespaces=[namespace], standalone=True, identity=identity)
+    else:
+        kopf.run(clusterwide=True, standalone=True, identity=identity)   # local development against kind

@@ -52,6 +52,9 @@ affinity: {}
 # Operator configuration
 logLevel: "INFO"
 reconcileInterval: 60
+# After an automatic restore, ignore further data-loss triggers for this long (stops restore loops).
+# Keep it shorter than any cooldown you put in front of a "delete" button, or a second loss is never restored.
+autoRestoreDedupMinutes: 15
 
 # Metrics endpoint
 metrics:

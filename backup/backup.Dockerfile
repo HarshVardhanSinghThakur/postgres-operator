@@ -9,7 +9,9 @@
 FROM python:3.11-alpine
 
 # postgresql-client gives us pg_dump and psql
-RUN apk add --no-cache postgresql-client
+# Pinned to 16, the newest server major the CRD allows (14/15/16). The unversioned "postgresql-client" floats to
+# the newest release (pg_dump 18), whose dumps contain settings older servers reject ("transaction_timeout").
+RUN apk add --no-cache postgresql16-client
 
 WORKDIR /app
 

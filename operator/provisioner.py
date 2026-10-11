@@ -76,7 +76,9 @@ def spec_hash(spec: dict) -> str:
     of key insertion order (Python dicts preserve order but
     we don't want to depend on that).
     """
-    canonical = json.dumps(spec, sort_keys=True)
+    # kopf passes spec as its own read-only Mapping type, which json cannot serialise; default=dict converts any
+    # such mapping (nested ones too) to a plain dict at the moment json meets it.
+    canonical = json.dumps(spec, sort_keys=True, default=dict)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]  # 16 chars is enough
 
 
@@ -306,7 +308,7 @@ class Provisioner:
                 patch = client.V1PersistentVolumeClaim(
                     metadata=client.V1ObjectMeta(annotations=self.annotations),
                     spec=client.V1PersistentVolumeClaimSpec(
-                        resources=client.V1ResourceRequirements(
+                        resources=client.V1VolumeResourceRequirements(
                             requests={"storage": storage}
                         )
                     )
@@ -335,7 +337,7 @@ class Provisioner:
             ),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteOnce"],  # one pod at a time (fine for primary)
-                resources=client.V1ResourceRequirements(
+                resources=client.V1VolumeResourceRequirements(
                     requests={"storage": storage}
                 ),
                 # No storageClassName = use cluster default
@@ -415,6 +417,8 @@ class Provisioner:
                         },
                     ),
 
+                    # Probe over TCP (-h 127.0.0.1), not the default unix socket: during first boot the image runs a temporary
+                    # server that only answers on the socket, which made the pod "ready" before the real server was up.
                     # ── Health probes ──────────────────────────────────────────
                     # liveness:  if this fails repeatedly, K8s restarts the pod
                     # readiness: if this fails, K8s removes pod from Service endpoints
@@ -422,7 +426,7 @@ class Provisioner:
 
                     liveness_probe=client.V1Probe(
                         exec=client.V1ExecAction(
-                            command=["pg_isready", "-U", "postgres"]
+                            command=["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
                         ),
                         initial_delay_seconds=30,   # give postgres time to start
                         period_seconds=10,
@@ -431,7 +435,7 @@ class Provisioner:
 
                     readiness_probe=client.V1Probe(
                         exec=client.V1ExecAction(
-                            command=["pg_isready", "-U", "postgres"]
+                            command=["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
                         ),
                         initial_delay_seconds=5,
                         period_seconds=5,
@@ -517,9 +521,13 @@ class Provisioner:
         Service name: <instance-name>
         DNS name:     <instance-name>.<namespace>.svc.cluster.local
         """
+        # component=database is essential: backup and restore Job pods carry the same managed-by and instance
+        # labels, so without it this Service also routed connections to those pods (which do not listen on 5432),
+        # giving intermittent "Connection refused" while a backup or restore was running.
         selector_labels = {
             "app.kubernetes.io/managed-by": "postgres-operator",
             "app.kubernetes.io/instance":   self.name,
+            "app.kubernetes.io/component":  COMPONENT_DB,
         }
 
         service_body = client.V1Service(
@@ -605,7 +613,7 @@ class Provisioner:
             ),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteOnce"],
-                resources=client.V1ResourceRequirements(
+                resources=client.V1VolumeResourceRequirements(
                     requests={"storage": storage}
                 ),
             ),
