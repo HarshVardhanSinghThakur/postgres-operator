@@ -228,7 +228,10 @@ class RestoreManager:
         """
         return client.V1Container(
             name="copy-backup",
-            image="busybox:latest",
+            # The postgres image is already on the node (the database pod runs it) and has sh/ls/cp. A separate
+            # "busybox:latest" is pulled from Docker Hub on EVERY run (":latest" means pull always), so a DNS or
+            # internet outage left the restore stuck in ImagePullBackOff, the one job that must work when things break.
+            image=postgres_image(self.db_spec.get("version", "15")),
             command=["sh", "-c"],
             args=[
                 "set -e && mkdir -p /backup && "

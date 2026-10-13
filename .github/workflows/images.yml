@@ -1,0 +1,67 @@
+# Builds the operator and backup images, publishes them to GitHub's registry, and (optionally) rolls them out.
+# This workflow is the only thing added for hosting: no operator code, chart or CRD is changed by it.
+# To only build images, delete the "deploy" job.
+name: images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { name: postgres-operator, file: operator.Dockerfile, context: . }
+          - { name: postgres-backup, file: backup/backup.Dockerfile, context: backup }
+    steps:
+      - uses: actions/checkout@v7
+      # registry names must be lowercase, GitHub user names may not be
+      - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.name }}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=sha,prefix=,format=short
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  deploy:
+    needs: images
+    runs-on: ubuntu-latest
+    concurrency: deploy-micro # never two rollouts at once
+    steps:
+      - name: Roll out on the Oracle VM
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          install -m 600 /dev/null key
+          printf '%s\n' "$KEY" > key
+          printf '%s\n' "$HOST_KEY" > known_hosts
+          ssh -i key -o BatchMode=yes -o UserKnownHostsFile=known_hosts -o StrictHostKeyChecking=yes \
+            "deploy@$HOST" "operator ${GITHUB_SHA::7}"
